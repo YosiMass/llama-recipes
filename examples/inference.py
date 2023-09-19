@@ -7,10 +7,11 @@ import fire
 import os
 import sys
 import time
-
+from typing import List
+import json
 import torch
-from transformers import LlamaTokenizer
 
+from transformers import LlamaTokenizer
 from llama_recipes.inference.safety_utils import get_safety_checker
 from llama_recipes.inference.model_utils import load_model, load_peft_model
 
@@ -21,6 +22,7 @@ def main(
     quantization: bool=False,
     max_new_tokens =100, #The maximum numbers of tokens to generate
     prompt_file: str=None,
+    output_file: str=None,
     seed: int=42, #seed value for reproducibility
     do_sample: bool=True, #Whether or not to use sampling ; use greedy decoding otherwise.
     min_length: int=None, #The minimum length of the sequence to be generated, input prompt + min_new_tokens
@@ -37,14 +39,20 @@ def main(
     use_fast_kernels: bool = False, # Enable using SDPA from PyTroch Accelerated Transformers, make use Flash Attention and Xformer memory-efficient kernels
     **kwargs
 ):
-    if prompt_file is not None:
+    print (f'prompt file {prompt_file}')
+    if prompt_file and output_file:
         assert os.path.exists(
             prompt_file
         ), f"Provided Prompt file does not exist {prompt_file}"
-        with open(prompt_file, "r") as f:
-            user_prompt = "\n".join(f.readlines())
+        prompts = []
+        with open(prompt_file, "r") as fin:
+            data = json.load(fin)
+            for record in data:
+                prompts.append(record)
+        fout = open(output_file, 'w')
     elif not sys.stdin.isatty():
         user_prompt = "\n".join(sys.stdin.readlines())
+        prompts = [user_prompt]
     else:
         print("No user prompt provided. Exiting.")
         sys.exit(1)
@@ -84,57 +92,70 @@ def main(
                                         enable_sensitive_topics,
                                         enable_salesforce_content_safety,
                                         )
+    print(f'\n\nsafey checker {len(safety_checker)}\n\n')
+    responses = []
+    count = 0
 
-    # Safety check of the user prompt
-    safety_results = [check(user_prompt) for check in safety_checker]
-    are_safe = all([r[1] for r in safety_results])
-    if are_safe:
-        print("User prompt deemed safe.")
-        print(f"User prompt:\n{user_prompt}")
-    else:
-        print("User prompt deemed unsafe.")
-        for method, is_safe, report in safety_results:
-            if not is_safe:
-                print(method)
-                print(report)
-        print("Skipping the inference as the prompt is not safe.")
-        sys.exit(1)  # Exit the program with an error status
-        
-    batch = tokenizer(user_prompt, padding='max_length', truncation=True, max_length=max_padding_length, return_tensors="pt")
+    print (f'do sample  {do_sample} max_new_tokens {max_new_tokens}')
+    for user_prompt in prompts:
+        user_prompt = user_prompt['prompt']
+        # Safety check of the user prompt
+        safety_results = [check(user_prompt) for check in safety_checker]
+        are_safe = all([r[1] for r in safety_results])
+        if are_safe:
+            print("User prompt deemed safe.")
+            #print(f"User prompt:\n{user_prompt}")
+        else:
+            print("User prompt deemed unsafe.")
+            for method, is_safe, report in safety_results:
+                if not is_safe:
+                    print(method)
+                    print(report)
+            #print("Skipping the inferece as the prompt is not safe.")
+            #sys.exit(1)  # Exit the program with an error status
 
-    batch = {k: v.to("cuda") for k, v in batch.items()}
-    start = time.perf_counter()
-    with torch.no_grad():
-        outputs = model.generate(
-            **batch,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            top_p=top_p,
-            temperature=temperature,
-            min_length=min_length,
-            use_cache=use_cache,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            length_penalty=length_penalty,
-            **kwargs 
-        )
-    e2e_inference_time = (time.perf_counter()-start)*1000
-    print(f"the inference time is {e2e_inference_time} ms")
-    output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Safety check of the model output
-    safety_results = [check(output_text) for check in safety_checker]
-    are_safe = all([r[1] for r in safety_results])
-    if are_safe:
-        print("User input and model output deemed safe.")
-        print(f"Model output:\n{output_text}")
-    else:
-        print("Model output deemed unsafe.")
-        for method, is_safe, report in safety_results:
-            if not is_safe:
-                print(method)
-                print(report)
-                
+        batch = tokenizer(user_prompt, return_tensors="pt")
+        batch = {k: v.to("cuda") for k, v in batch.items()}
+
+        start = time.perf_counter()
+        with torch.no_grad():
+            outputs = model.generate(
+                **batch,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                top_p=top_p,
+                temperature=temperature,
+                min_length=min_length,
+                use_cache=use_cache,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                length_penalty=length_penalty,
+                **kwargs
+            )
+        e2e_inference_time = (time.perf_counter()-start)*1000
+        print(f"the inference time is {e2e_inference_time} ms")
+        output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        responses.append({'response': output_text})
+
+        # Safety check of the model output
+        safety_results = [check(output_text) for check in safety_checker]
+        are_safe = all([r[1] for r in safety_results])
+        if are_safe:
+            print("User input and model output deemed safe.")
+            #print(f"Model output:\n{output_text}")
+
+        else:
+            print("Model output deemed unsafe.")
+            for method, is_safe, report in safety_results:
+                if not is_safe:
+                    print(method)
+                    print(report)
+        count += 1
+        print(f'finished {count} queries')
+
+    if output_file:
+        json.dump(responses, fout, indent=4)
+        fout.close()
 
 if __name__ == "__main__":
     fire.Fire(main)
